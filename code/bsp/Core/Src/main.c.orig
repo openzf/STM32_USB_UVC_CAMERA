@@ -1,0 +1,509 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * <h2><center>&copy; Copyright (c) 2021 STMicroelectronics.
+  * All rights reserved.</center></h2>
+  *
+  * This software component is licensed by ST under BSD 3-Clause license,
+  * the "License"; You may not use this file except in compliance with the
+  * License. You may obtain a copy of the License at:
+  *                        opensource.org/licenses/BSD-3-Clause
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "dma2d.h"
+#include "fatfs.h"
+#include "ltdc.h"
+#include "quadspi.h"
+#include "sdmmc.h"
+#include "spi.h"
+#include "usart.h"
+#include "gpio.h"
+#include "fmc.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "driver_spi_flash.h"
+#include "driver_qspi_flash.h"
+#include "dev_lcd.h"
+#include "delay.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if(GPIO_Pin == KEY1_Pin) {
+        HAL_GPIO_TogglePin(LED0_GPIO_Port,LED0_Pin);
+        HAL_GPIO_TogglePin(LED1_GPIO_Port,LED1_Pin);
+    }
+}
+
+void qspi_test(void)
+{
+    W25QXX_Init();
+    uint16_t id = W25QXX_ReadID();
+    printf("\r\nqspi id is %x\r\n",id);
+    uint8_t tx_buff[]="hello1234";
+    uint8_t rx_buff[10];
+    uint8_t rx_buff1[10];
+
+    W25QXX_Write(tx_buff, 0, sizeof(tx_buff));
+    W25QXX_Read(rx_buff, 0, sizeof(tx_buff));
+
+
+    printf("data is:%s\r\n",rx_buff);
+
+    uint32_t tempreg=0;
+
+    //MemroyMap 模式设置
+
+    QSPI_EnableMemoryMappedMode();
+
+    //设置QSPI FLASH空间的MPU保护
+    SCB->SHCSR&=~(1<<16);			//禁止MemManage
+    MPU->CTRL&=~(1<<0);				//禁止MPU
+    MPU->RNR=0;						//设置保护区域编号为0(1~7可以给其他内存用)
+    MPU->RBAR=0X90000000;			//基地址为0X9000 000,即QSPI的起始地址
+    MPU->RASR=0X0303002D;			//设置相关保护参数(禁止共用,允许cache,允许缓冲),详见MPU实验的解析
+    MPU->CTRL=(1<<2)|(1<<0);		//使能PRIVDEFENA,使能MPU
+    SCB->SHCSR|=1<<16;				//使能MemManage
+
+
+
+    memset(rx_buff1,0,sizeof(tx_buff));
+    __IO uint8_t* qspi_addr = (__IO uint8_t*)(0x90000000);
+    memcpy(rx_buff1,(uint8_t *)qspi_addr,sizeof(tx_buff));
+
+    printf("data1 is:%s\r\n",rx_buff1);
+
+}
+
+void sdmmc_test(void) {
+    int sdcard_status = 0;
+    HAL_SD_CardCIDTypedef sdcard_cid;
+    sdcard_status = HAL_SD_GetCardState(&hsd1);
+    if(sdcard_status == HAL_SD_CARD_TRANSFER)
+    {
+        printf("SD card init ok!\r\n\r\n");
+
+        //打印SD卡基本信息
+        printf("SD card information!\r\n");
+        printf("CardCapacity: %llu\r\n",((unsigned long long)hsd1.SdCard.BlockSize*hsd1.SdCard.BlockNbr));
+        printf("CardBlockSize: %d \r\n",hsd1.SdCard.BlockSize);
+        printf("RCA: %d \r\n",hsd1.SdCard.RelCardAdd);
+        printf("CardType: %d \r\n",hsd1.SdCard.CardType);
+
+        //读取并打印SD卡的CID信息
+        HAL_SD_GetCardCID(&hsd1,&sdcard_cid);
+        printf("ManufacturerID: %d \r\n",sdcard_cid.ManufacturerID);
+    }
+    else
+    {
+        printf("SD card init fail!\r\n" );
+    }
+
+}
+
+
+// 工具做
+#define WORK_BUFFER_SIZE  4096
+static char work_buffer[WORK_BUFFER_SIZE];
+
+uint8_t exf_getfree(uint8_t *drv,uint32_t *total,uint32_t *free)
+{
+    FATFS *fs1;
+    uint8_t res;
+    uint32_t fre_clust=0, fre_sect=0, tot_sect=0;
+    res =(uint32_t)f_getfree((const TCHAR*)drv, (DWORD*)&fre_clust, &fs1);
+    if(res==0)
+    {
+        tot_sect=(fs1->n_fatent-2)*fs1->csize;
+        fre_sect=fre_clust*fs1->csize;
+#if _MAX_SS!=512
+        tot_sect*=fs1->ssize/512;
+        fre_sect*=fs1->ssize/512;
+#endif
+        *total=tot_sect>>1;	//?λ?KB
+        *free=fre_sect>>1;	//?λ?KB
+    }
+    return 0;
+}
+
+
+//   fatfs test
+void fatfs_sd_init(void)
+{
+    retSD = f_mount(&SDFatFS,SDPath, 1);
+    if(retSD)
+    {
+        // 如果没文件系统
+        if(retSD == FR_NO_FILESYSTEM)
+        {
+            printf("remkfs sdcard\r\n");
+            retSD = f_mkfs(SDPath,FM_ANY,0,work_buffer,WORK_BUFFER_SIZE);
+            if(retSD == FR_OK)
+            {
+                retSD = f_mount(&SDFatFS, SDPath, 0);
+                if(retSD == FR_OK) {
+                    printf(" mount sdcard ok\r\n");
+                }
+            }
+        }
+    }
+    else {
+        printf(" mount sdcard ok\r\n");
+    }
+
+//    uint32_t total,free;
+
+//    exf_getfree("0:",&total,&free);
+//    printf("sdcard size:%d KB  %dMB, free size:%d KB   %dMB\r\n",total,total/1024,free,free/1024);
+}
+
+
+FATFS spi_flash;
+void fatfs_spi_flash_init()
+{
+    FRESULT retSD;
+    // 挂载spi flash -- 如果userfs不能用, 就用自己定义的fatfs
+    retSD = f_mount(&spi_flash, USERPath, 0);
+    // 如果挂载不成功
+    if(retSD)
+    {
+        // 如果没文件系统
+        if(retSD == FR_NO_FILESYSTEM)
+        {
+            printf("mkfs spi-flash \r\n");
+            retSD = f_mkfs(USERPath,FM_FAT,0,work_buffer,WORK_BUFFER_SIZE);
+            if(retSD == FR_OK)
+            {
+                retSD = f_mount(&USERFatFS, USERPath, 0);
+                if(retSD == FR_OK) {
+                    printf("spi-flash init fs ok!\r\n");
+                }
+            }
+
+        }
+        else {
+            printf("spi-flash init fs ok!\r\n");
+        }
+    }else {
+        printf(" mount spi-flash ok\r\n");
+    }
+//		uint32_t total,free;
+//		exf_getfree("1:",&total,&free);
+//    printf("flash size:%d KB  %dMB, free size:%d KB   %dMB\r\n",total,total/1024,free,free/1024);
+}
+
+
+FRESULT fr;
+FIL     fd;
+
+char filename[] = "1:test.txt";
+uint8_t write_dat[] = "Hello,FATFS!\n";
+uint16_t write_num = 0;
+
+unsigned int count = 0;
+unsigned char read_buf[50] = {0};
+
+static void fatfs_test(char *filename_t)
+{
+
+    fr = f_open(&fd, filename_t, FA_CREATE_ALWAYS | FA_WRITE);
+    if(fr == FR_OK)
+    {
+				printf("\r\nfatfs open file ok\r\n");
+        fr = f_write(&fd, write_dat, sizeof(write_dat), (void *)&write_num);
+        fr = f_close(&fd);
+        if(fr == FR_OK)
+        {
+            retSD = f_open(&fd, filename_t, FA_OPEN_EXISTING | FA_READ);
+            if(retSD == FR_OK)
+            {
+                retSD = f_read(&fd, read_buf, sizeof(read_buf), &count);
+                if(retSD != FR_OK)
+                {
+
+                    f_close(&fd);
+                }
+                else
+                {
+                    printf("\r\nfatfs read buf:%s\r\n", read_buf);
+                    f_close(&fd);
+                }
+            }
+        }
+    }else{
+			 printf("\r\nfatfs  open file error\r\n");
+		}
+
+}
+
+
+void fsmc_sdram_test(void)
+{  
+	uint32_t i=0;  	  
+	uint32_t temp=0;	   
+	uint32_t sval=0;	//在地址0读到的数据	  				   
+	//每隔16K字节,写入一个数据,总共写入2048个数据,刚好是32M字节
+	printf("SDRAM begin\r\n");
+	for(i=0;i<32*1024*1024;i+=16*1024)
+	{
+		*(__IO uint32_t*)(Bank5_SDRAM_ADDR+i)=temp; 
+		temp++;
+	}
+	//依次读出之前写入的数据,进行校验		  
+ 	for(i=0;i<32*1024*1024;i+=16*1024) 
+	{	
+  		temp=*(__IO uint32_t*)(Bank5_SDRAM_ADDR+i);
+		if(i==0)sval=temp;
+ 		else if(temp<=sval)break;//后面读出的数据一定要比第一次读到的数据大.	   		   
+		printf("SDRAM Capacity:%dKB\r\n",(uint16_t)(temp-sval+1)*16);//打印SDRAM容量
+ 	}					 
+}	
+
+//使能CPU的L1-Cache
+void Cache_Enable(void)
+{
+    SCB_EnableICache();//使能I-Cache
+    SCB_EnableDCache();//使能D-Cache
+    SCB->CACR|=1<<2;   //强制D-Cache透写,如不开启,实际使用中可能遇到各种问题
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+   //Cache_Enable();
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART1_UART_Init();
+  MX_SPI2_Init();
+  MX_QUADSPI_Init();
+  MX_SDMMC1_SD_Init();
+  MX_FATFS_Init();
+  MX_FMC_Init();
+  MX_DMA2D_Init();
+  MX_LTDC_Init();
+  /* USER CODE BEGIN 2 */
+	MX_SDRAM_InitEx();
+		
+		delay_init(400);
+    printf("hello world\r\n");
+    uart_init();
+    SPI_FLASH_Init();
+    qspi_test();
+
+		//spiflash_mkfs();
+		//fatfs_spi_flash_init();
+
+		//fatfs_sd_init();
+		 //MX_FATFS_USER_Init();
+		 
+		//sdcard_fatfs_test();
+		//fatfs_read_test();
+		//fatfs_spi_flash_init();
+		//fatfs_test("0:test.txt");
+		//fatfs_test("1:test.txt");
+		 dev_lcd_init();
+		 dev_lcd_show_string(20,20,24,"hello world kirito!",RED);
+		// fsmc_sdram_test();
+    //sdcard_fatfs_test();
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+    while (1)
+    {
+
+
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+
+  /** Supply configuration update enable
+  */
+  HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
+
+  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+  /** Macro to configure the PLL clock source
+  */
+  __HAL_RCC_PLL_PLLSOURCE_CONFIG(RCC_PLLSOURCE_HSE);
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 5;
+  RCC_OscInitStruct.PLL.PLLN = 192;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
+  RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
+  RCC_OscInitStruct.PLL.PLLFRACN = 0;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
+                              |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
+  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_LTDC|RCC_PERIPHCLK_USART1
+                              |RCC_PERIPHCLK_SPI2|RCC_PERIPHCLK_SDMMC
+                              |RCC_PERIPHCLK_QSPI|RCC_PERIPHCLK_FMC
+                              |RCC_PERIPHCLK_CKPER;
+  PeriphClkInitStruct.PLL2.PLL2M = 5;
+  PeriphClkInitStruct.PLL2.PLL2N = 160;
+  PeriphClkInitStruct.PLL2.PLL2P = 2;
+  PeriphClkInitStruct.PLL2.PLL2Q = 2;
+  PeriphClkInitStruct.PLL2.PLL2R = 32;
+  PeriphClkInitStruct.PLL2.PLL2RGE = RCC_PLL2VCIRANGE_2;
+  PeriphClkInitStruct.PLL2.PLL2VCOSEL = RCC_PLL2VCOWIDE;
+  PeriphClkInitStruct.PLL2.PLL2FRACN = 0;
+  PeriphClkInitStruct.PLL3.PLL3M = 5;
+  PeriphClkInitStruct.PLL3.PLL3N = 160;
+  PeriphClkInitStruct.PLL3.PLL3P = 2;
+  PeriphClkInitStruct.PLL3.PLL3Q = 2;
+  PeriphClkInitStruct.PLL3.PLL3R = 32;
+  PeriphClkInitStruct.PLL3.PLL3RGE = RCC_PLL3VCIRANGE_2;
+  PeriphClkInitStruct.PLL3.PLL3VCOSEL = RCC_PLL3VCOWIDE;
+  PeriphClkInitStruct.PLL3.PLL3FRACN = 0;
+  PeriphClkInitStruct.FmcClockSelection = RCC_FMCCLKSOURCE_D1HCLK;
+  PeriphClkInitStruct.QspiClockSelection = RCC_QSPICLKSOURCE_CLKP;
+  PeriphClkInitStruct.SdmmcClockSelection = RCC_SDMMCCLKSOURCE_PLL2;
+  PeriphClkInitStruct.CkperClockSelection = RCC_CLKPSOURCE_HSI;
+  PeriphClkInitStruct.Spi123ClockSelection = RCC_SPI123CLKSOURCE_CLKP;
+  PeriphClkInitStruct.Usart16ClockSelection = RCC_USART16CLKSOURCE_D2PCLK2;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+    /* User can add his own implementation to report the HAL error return state */
+
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+    /* User can add his own implementation to report the file name and line number,
+       tex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
+
+/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/

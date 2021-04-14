@@ -1,0 +1,351 @@
+/*----------------------------------------------------------------------------------------------------------------
+ * Copyright(c)
+ * ---------------------------------------------------------------------------------------------------------------
+ * File Name : kprotocol.c
+ * Author    : kirito
+ * Brief     : 
+ * Date      :  2020.11.06
+ * ---------------------------------------------------------------------------------------------------------------
+ * Modifier                                    Data                                             Brief
+ * -------------------------------------------------------------------------------------------------------------*/
+
+#include "driver_spi_flash.h"
+#include "gpio.h"
+#include "spi.h"
+
+
+static __IO uint32_t  SPITimeout = SPIT_LONG_TIMEOUT;
+static  uint16_t SPI_TIMEOUT_UserCallback(uint8_t errorCode)
+{
+
+		printf("SPI ! time out errorCode = %d",errorCode);
+    return 0;
+}
+
+// cs -low
+static void SPI_FLASH_CS_LOW() {
+    HAL_GPIO_WritePin(FLASH_CS_GPIO_Port,FLASH_CS_Pin,0);
+}
+
+// cs- high
+static void  SPI_FLASH_CS_HIGH() {
+    HAL_GPIO_WritePin(FLASH_CS_GPIO_Port,FLASH_CS_Pin,1);
+}
+
+// 内部函数
+static uint8_t SPI_FLASH_ReadByte(void);
+static uint8_t SPI_FLASH_SendByte(uint8_t byte);
+static void SPI_FLASH_WriteEnable(void);
+static void SPI_FLASH_WaitForWriteEnd(void);
+
+
+// test
+#define  FLASH_WriteAddress     0x00000
+#define  FLASH_ReadAddress      FLASH_WriteAddress
+#define  FLASH_SectorToErase    FLASH_WriteAddress
+
+#define BufferSize 4096
+uint8_t Tx_Buffer[] = "hell world";
+uint8_t Rx_Buffer[BufferSize];
+
+
+/**
+* @ Function Name : kprotocol_init
+* @ Author        : kirito
+* @ Brief         : service
+* @ Date          : 2020.11.06
+* @ Modify        : ...
+**/
+char SPI_FLASH_Init(void)
+{
+
+    // cs -high
+    SPI_FLASH_CS_HIGH();
+    // enable spi1
+    __HAL_SPI_ENABLE(&hspi2);
+
+    SPI_Flash_WAKEUP();
+		
+	  printf("spi test begin\r\n");
+    // read flash_id
+    uint32_t id = SPI_FLASH_ReadID();
+    // read device_id
+    uint32_t did = SPI_FLASH_ReadDeviceID();
+   
+    if(id == sFLASH_ID) {
+        printf("spi flash init ok!!!");
+
+//        SPI_FLASH_SectorErase(FLASH_SectorToErase);
+
+//        SPI_FLASH_BufferWrite(Tx_Buffer, FLASH_WriteAddress, BufferSize);
+
+//        SPI_FLASH_BufferRead(Rx_Buffer, FLASH_WriteAddress, BufferSize);
+//        printf("spi data:\r\n%s", Rx_Buffer);
+				return 0;
+    }
+		return -1;
+}
+
+// ---------------- API ---- 
+
+// 擦除扇区
+void SPI_FLASH_SectorErase(uint32_t SectorAddr)
+{
+    SPI_FLASH_WriteEnable();
+    SPI_FLASH_WaitForWriteEnd();
+
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_SectorErase);
+    SPI_FLASH_SendByte((SectorAddr & 0xFF0000) >> 16);
+    SPI_FLASH_SendByte((SectorAddr & 0xFF00) >> 8);
+    SPI_FLASH_SendByte(SectorAddr & 0xFF);
+    SPI_FLASH_CS_HIGH();
+    SPI_FLASH_WaitForWriteEnd();
+}
+
+// 全部擦除
+void SPI_FLASH_BulkErase(void)
+{
+    SPI_FLASH_WriteEnable();
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_ChipErase);
+    SPI_FLASH_CS_HIGH();
+    SPI_FLASH_WaitForWriteEnd();
+}
+
+// 写页
+void SPI_FLASH_PageWrite(uint8_t* pBuffer, uint32_t WriteAddr, uint16_t NumByteToWrite)
+{
+
+    SPI_FLASH_WriteEnable();
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_PageProgram);
+    SPI_FLASH_SendByte((WriteAddr & 0xFF0000) >> 16);
+    SPI_FLASH_SendByte((WriteAddr & 0xFF00) >> 8);
+    SPI_FLASH_SendByte(WriteAddr & 0xFF);
+    if(NumByteToWrite > SPI_FLASH_PerWritePageSize)
+    {
+        NumByteToWrite = SPI_FLASH_PerWritePageSize;
+
+    }
+    while (NumByteToWrite--)
+    {
+        SPI_FLASH_SendByte(*pBuffer);
+        pBuffer++;
+    }
+    SPI_FLASH_CS_HIGH();
+    SPI_FLASH_WaitForWriteEnd();
+}
+
+// 把数据写入到flash
+void SPI_FLASH_BufferWrite(uint8_t* pBuffer, uint32_t WriteAddr, uint16_t NumByteToWrite)
+{
+    uint8_t NumOfPage = 0, NumOfSingle = 0, Addr = 0, count = 0, temp = 0;
+
+    // page size == 256字节, 如果地址小于256, 就写第0个页
+    Addr = WriteAddr % SPI_FLASH_PageSize;
+
+    // 差几个可以对齐一页
+    count = SPI_FLASH_PageSize - Addr;
+
+    // 会写几页
+    NumOfPage =  NumByteToWrite / SPI_FLASH_PageSize;
+    // 求余 ,计算不满一页的直接数
+    NumOfSingle = NumByteToWrite % SPI_FLASH_PageSize;
+
+    // 如果是第0地址
+    if (Addr == 0)
+    {
+        /* 小于一页 */
+        if (NumOfPage == 0)
+        {
+            SPI_FLASH_PageWrite(pBuffer, WriteAddr, NumByteToWrite);
+        }
+        // 写剩余字节到flash
+        else /* NumByteToWrite > SPI_FLASH_PageSize */
+        {
+
+            // 写整页
+            while (NumOfPage--)
+            {
+                SPI_FLASH_PageWrite(pBuffer, WriteAddr, SPI_FLASH_PageSize);
+                WriteAddr +=  SPI_FLASH_PageSize;
+                pBuffer += SPI_FLASH_PageSize;
+            }
+            // 写不满一页的数据
+            SPI_FLASH_PageWrite(pBuffer, WriteAddr, NumOfSingle);
+        }
+    }
+    else
+    {
+        // 如果数据小于一页
+        if (NumOfPage == 0)
+        {
+            // 当前页剩余的个数位置比剩余的数据小, 一次写不完
+            if (NumOfSingle > count)
+            {
+                temp = NumOfSingle - count;
+                // 先写满当前页
+                SPI_FLASH_PageWrite(pBuffer, WriteAddr, count);
+                WriteAddr +=  count;
+                pBuffer += count;
+                // 再写剩余的数据
+                SPI_FLASH_PageWrite(pBuffer, WriteAddr, temp);
+            }
+            else
+            {
+// 当前页剩余的页面能写完剩余的数据
+                SPI_FLASH_PageWrite(pBuffer, WriteAddr, NumByteToWrite);
+            }
+        }
+        // 如果是很多页
+        else /* NumByteToWrite > SPI_FLASH_PageSize */
+        {
+
+            NumByteToWrite -= count;
+            NumOfPage =  NumByteToWrite / SPI_FLASH_PageSize;
+            NumOfSingle = NumByteToWrite % SPI_FLASH_PageSize;
+
+            // 先把不对齐的数据写了
+            SPI_FLASH_PageWrite(pBuffer, WriteAddr, count);
+            WriteAddr +=  count;
+            pBuffer += count;
+
+            // 先写整数页
+            while (NumOfPage--)
+            {
+                SPI_FLASH_PageWrite(pBuffer, WriteAddr, SPI_FLASH_PageSize);
+                WriteAddr +=  SPI_FLASH_PageSize;
+                pBuffer += SPI_FLASH_PageSize;
+            }
+            // 再写单页
+            if (NumOfSingle != 0)
+            {
+                SPI_FLASH_PageWrite(pBuffer, WriteAddr, NumOfSingle);
+            }
+        }
+    }
+}
+
+
+// 从flash中读取数据到缓冲区
+void SPI_FLASH_BufferRead(uint8_t* pBuffer, uint32_t ReadAddr, uint16_t NumByteToRead)
+{
+
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_ReadData);
+    SPI_FLASH_SendByte((ReadAddr & 0xFF0000) >> 16);
+    SPI_FLASH_SendByte((ReadAddr& 0xFF00) >> 8);
+    SPI_FLASH_SendByte(ReadAddr & 0xFF);
+    while (NumByteToRead--)
+    {
+        *pBuffer = SPI_FLASH_SendByte(Dummy_Byte);
+        pBuffer++;
+    }
+    SPI_FLASH_CS_HIGH();
+}
+
+// 读取flash id
+uint32_t SPI_FLASH_ReadID(void)
+{
+    uint32_t Temp = 0, Temp0 = 0, Temp1 = 0, Temp2 = 0;
+
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_JedecDeviceID);
+    Temp0 = SPI_FLASH_SendByte(Dummy_Byte);
+    Temp1 = SPI_FLASH_SendByte(Dummy_Byte);
+    Temp2 = SPI_FLASH_SendByte(Dummy_Byte);
+    SPI_FLASH_CS_HIGH();
+    Temp = (Temp0 << 16) | (Temp1 << 8) | Temp2;
+    return Temp;
+}
+
+
+// 读取设备id
+uint32_t SPI_FLASH_ReadDeviceID(void)
+{
+    uint32_t Temp = 0;
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_DeviceID);
+    SPI_FLASH_SendByte(Dummy_Byte);
+    SPI_FLASH_SendByte(Dummy_Byte);
+    SPI_FLASH_SendByte(Dummy_Byte);
+    Temp = SPI_FLASH_SendByte(Dummy_Byte);
+    SPI_FLASH_CS_HIGH();
+    return Temp;
+}
+
+
+// 休眠
+void SPI_Flash_PowerDown(void)
+{
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_PowerDown);
+    SPI_FLASH_CS_HIGH();
+}
+
+// 唤醒
+void SPI_Flash_WAKEUP(void)
+{
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_ReleasePowerDown);
+    SPI_FLASH_CS_HIGH();
+}
+
+//------------------- API end --------------
+
+// 读取数据
+static uint8_t SPI_FLASH_ReadByte(void)
+{
+    return (SPI_FLASH_SendByte(Dummy_Byte));
+}
+// 写入数据
+static uint8_t SPI_FLASH_SendByte(uint8_t byte)
+{
+    uint8_t Rxdata;
+    HAL_SPI_TransmitReceive(&hspi2,&byte,&Rxdata,1, 2000);
+    return Rxdata;
+}
+
+// 写使能
+static void SPI_FLASH_WriteEnable(void)
+{
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_WriteEnable);
+    SPI_FLASH_CS_HIGH();
+}
+
+// 写禁止
+static void SPI_FLASH_WriteDisable(void)
+{
+    SPI_FLASH_CS_LOW();
+    SPI_FLASH_SendByte(W25X_WriteDisable);
+    SPI_FLASH_CS_HIGH();
+}
+// 等待busy位清空, 带有超时检测的
+static void SPI_FLASH_WaitForWriteEnd(void)
+{
+    uint8_t FLASH_Status = 0;
+    SPI_FLASH_CS_LOW();
+
+    SPI_FLASH_SendByte(W25X_ReadStatusReg);
+    SPITimeout = SPIT_FLAG_TIMEOUT;
+    do
+    {
+        FLASH_Status = SPI_FLASH_SendByte(Dummy_Byte);
+        {
+            if((SPITimeout--) == 0)
+            {
+                SPI_TIMEOUT_UserCallback(4);
+                return;
+            }
+        }
+    }
+    while ((FLASH_Status & WIP_Flag) == SET);
+    SPI_FLASH_CS_HIGH();
+}
+
+
+
+
+
